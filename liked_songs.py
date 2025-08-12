@@ -1,20 +1,35 @@
 import os
+import logging
 import spotipy
-from spotipy.oauth2 import SpotifyOAuth
+from spotipy.oauth2 import SpotifyOAuth, SpotifyClientCredentials
 import pandas as pd
 from tqdm import tqdm
 from typing import List, Optional
+import time
 
 # Spotify authorization scope
 SCOPE = "user-library-read"
 
 # Authenticate
-sp = spotipy.Spotify(
+# Reduce noisy HTTP error logs
+logging.getLogger("spotipy").setLevel(logging.ERROR)
+logging.getLogger("spotipy.client").setLevel(logging.ERROR)
+logging.getLogger("urllib3").setLevel(logging.ERROR)
+
+# Two separate clients: user-auth for library access; app-auth for features/analysis
+sp_user = spotipy.Spotify(
     auth_manager=SpotifyOAuth(
         client_id=os.getenv("SPOTIPY_CLIENT_ID"),
         client_secret=os.getenv("SPOTIPY_CLIENT_SECRET"),
         redirect_uri=os.getenv("SPOTIPY_REDIRECT_URI"),
         scope=SCOPE,
+    )
+)
+
+sp_app = spotipy.Spotify(
+    auth_manager=SpotifyClientCredentials(
+        client_id=os.getenv("SPOTIPY_CLIENT_ID"),
+        client_secret=os.getenv("SPOTIPY_CLIENT_SECRET"),
     )
 )
 
@@ -28,7 +43,7 @@ def get_recent_liked_tracks(max_tracks: int = 100):
     print(f"Fetching up to {max_tracks} most recent liked songs...")
     while len(tracks) < max_tracks:
         to_fetch = min(page_limit, max_tracks - len(tracks))
-        results = sp.current_user_saved_tracks(limit=to_fetch, offset=offset)
+        results = sp_user.current_user_saved_tracks(limit=to_fetch, offset=offset)
         if not results or not results.get("items"):
             break
         items = results.get("items") or []
@@ -39,8 +54,42 @@ def get_recent_liked_tracks(max_tracks: int = 100):
     return tracks[:max_tracks]
 
 
+def get_user_playlist_tracks_by_name(playlist_name: str) -> List[dict]:
+    print(f"Searching for playlist named '{playlist_name}'...")
+    playlist_id: Optional[str] = None
+    limit = 50
+    offset = 0
+    while True:
+        playlists = sp_user.current_user_playlists(limit=limit, offset=offset) or {}
+        items = playlists.get("items") or []
+        for pl in items:
+            if (pl.get("name") or "").strip().lower() == playlist_name.strip().lower():
+                playlist_id = pl.get("id")
+                break
+        if playlist_id or not playlists.get("next") or len(items) == 0:
+            break
+        offset += limit
+
+    if not playlist_id:
+        raise RuntimeError(f"Playlist '{playlist_name}' not found")
+
+    print(f"Fetching tracks from playlist '{playlist_name}' ({playlist_id})...")
+    tracks: List[dict] = []
+    limit = 100
+    offset = 0
+    while True:
+        page = sp_user.playlist_items(playlist_id, limit=limit, offset=offset) or {}
+        items = page.get("items") or []
+        tracks.extend(items)
+        if not page.get("next") or len(items) == 0:
+            break
+        offset += limit
+
+    return tracks
+
+
 # Extract metadata and audio features
-def extract_track_data(tracks):
+def extract_track_data(tracks, include_analysis: bool = False):
     data = []
     print("Extracting metadata and audio features...")
 
@@ -56,22 +105,43 @@ def extract_track_data(tracks):
         track_ids: List[str],
     ) -> List[Optional[dict]]:
         try:
-            features_batch = sp.audio_features(tracks=track_ids)
+            # Prefer user-auth client; fallback handled below
+            features_batch = sp_user.audio_features(tracks=track_ids)
             return features_batch or [None] * len(track_ids)
         except Exception:
             # Fallback: fetch per-track to skip problematic IDs
             fallback_features: List[Optional[dict]] = []
             for track_id in track_ids:
-                try:
-                    single = sp.audio_features(tracks=[track_id])
-                    fallback_features.append(single[0] if single else None)
-                except Exception:
-                    fallback_features.append(None)
+                single_feat: Optional[dict] = None
+                for attempt in range(4):
+                    try:
+                        # Try user client first, then app client
+                        try:
+                            single = sp_user.audio_features(tracks=[track_id])
+                        except Exception:
+                            single = sp_app.audio_features(tracks=[track_id])
+                        single_feat = single[0] if single else None
+                        break
+                    except Exception:
+                        time.sleep(2**attempt * 0.5)
+                        continue
+                fallback_features.append(single_feat)
             return fallback_features
 
     def fetch_audio_analysis_fields(track_id: str) -> dict:
         try:
-            analysis = sp.audio_analysis(track_id)
+            # Small retry for analysis as well
+            analysis = None
+            last_exc = None
+            for attempt in range(3):
+                try:
+                    analysis = sp_app.audio_analysis(track_id)
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    time.sleep(2**attempt * 0.5)
+            if analysis is None:
+                raise last_exc or Exception("analysis failed")
             track_info = analysis.get("track", {}) if isinstance(analysis, dict) else {}
             beats = analysis.get("beats", []) if isinstance(analysis, dict) else []
 
@@ -132,7 +202,11 @@ def extract_track_data(tracks):
             artist_info = None
             if artist_id:
                 try:
-                    artist_info = sp.artist(artist_id)
+                    # Prefer user client; fallback to app client
+                    try:
+                        artist_info = sp_user.artist(artist_id)
+                    except Exception:
+                        artist_info = sp_app.artist(artist_id)
                 except Exception:
                     artist_info = None
             genres = (
@@ -140,7 +214,9 @@ def extract_track_data(tracks):
             )
 
             analysis_fields = (
-                fetch_audio_analysis_fields(track.get("id")) if track.get("id") else {}
+                fetch_audio_analysis_fields(track.get("id"))
+                if include_analysis and track.get("id")
+                else {}
             )
 
             data.append(
@@ -200,7 +276,50 @@ def extract_track_data(tracks):
 
 # Main execution
 if __name__ == "__main__":
-    liked_tracks = get_recent_liked_tracks(max_tracks=10)
-    df = extract_track_data(liked_tracks)
+    # Build CSV from playlist 'Movement'
+    playlist_tracks = get_user_playlist_tracks_by_name("Movement")
+    df = extract_track_data(playlist_tracks, include_analysis=False)
+
+    # Derive BPM and human-readable key
+    def key_index_to_name(key_index: Optional[int]) -> Optional[str]:
+        names = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+        if key_index is None:
+            return None
+        try:
+            i = int(key_index)
+        except Exception:
+            return None
+            if 0 <= i <= 11:
+                return names[i]
+        return None
+
+    def key_with_mode(row) -> Optional[str]:
+        key_name = key_index_to_name(row.get("key"))
+        if key_name is None:
+            return None
+        mode = row.get("mode")
+        suffix = "major" if mode == 1 else "minor" if mode == 0 else None
+        return f"{key_name} {suffix}" if suffix else key_name
+
+    if not df.empty:
+        if "tempo" in df.columns:
+            df["tempo"] = pd.to_numeric(df["tempo"], errors="coerce")
+            df["bpm"] = df["tempo"].round(1)
+        else:
+            df["bpm"] = None
+        df["key_name"] = df.apply(key_with_mode, axis=1)
+
+        preferred_cols = [
+            "name",
+            "artist",
+            "album",
+            "release_date",
+            "id",
+            "bpm",
+            "key_name",
+        ]
+        other_cols = [c for c in df.columns if c not in preferred_cols]
+        df = df[preferred_cols + other_cols]
+
     df.to_csv("liked_songs.csv", index=False)
     print("Saved to liked_songs.csv")
